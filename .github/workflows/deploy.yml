@@ -1,0 +1,51 @@
+name: deploy
+
+# Self-hosted runner on the production box. Only push to main triggers it
+# (never pull_request), so forks cannot run code on this machine.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  DEPLOY_DIR: /home/tmh/Projects/dont/fb-pg-cmt
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, fb-order-bot]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: docker build --target test -t fbhook-test .
+
+      - name: Update deploy dir
+        run: |
+          cd "$DEPLOY_DIR"
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Deploy
+        run: |
+          cd "$DEPLOY_DIR"
+          docker compose up -d --build --remove-orphans
+
+      - name: Health check
+        run: |
+          cd "$DEPLOY_DIR"
+          set -a; . ./.env; set +a
+          for i in $(seq 1 20); do
+            curl -fsS "http://127.0.0.1:${API_PORT:-8000}/healthz" && exit 0
+            sleep 3
+          done
+          docker compose logs --tail 50 api worker
+          exit 1
+
+      - name: Prune old images
+        if: success()
+        run: docker image prune -f
