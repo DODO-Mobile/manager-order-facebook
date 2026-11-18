@@ -1,0 +1,11 @@
+{
+  "posts": [
+    {"page_id": "PAGE_ID", "post_id": "PAGEID_POSTID", "campaign_id": "c1", "enabled": true, "catalog_id": "cat1"}
+  ],
+  "catalog": [
+    {"catalog_id": "cat1", "sku": "YEM", "name": "yếm", "aliases": ["yem"], "unit_price": 689000,
+     "colors": {"xanh": ["xanh duong"], "hồng": ["hong"]}, "sizes": ["XS", "S", "M"], "in_stock": true},
+    {"catalog_id": "cat1", "sku": "KEP", "name": "kẹp", "aliases": ["kep"], "unit_price": 165000,
+     "colors": {}, "sizes": [], "in_stock": true}
+  ]
+}

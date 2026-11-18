@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order Bot Admin</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2330;--mut:#667085;--line:#e4e7ec;--ok:#12805c;--bad:#c4321c;--warn:#a15c07;--acc:#2f5bea;--okbg:#e3f5ee;--badbg:#fde8e4;--warnbg:#fdf1dc;--accbg:#e8edff}
+@media (prefers-color-scheme:dark){:root{--bg:#10141b;--card:#181e28;--fg:#e6e9ef;--mut:#8d97a8;--line:#2a3342;--ok:#4cc79a;--bad:#ff8a75;--warn:#f0b35a;--acc:#8aa5ff;--okbg:#14352b;--badbg:#3d1e19;--warnbg:#3a2c12;--accbg:#1d2748}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 16px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+h1{font-size:16px;margin:0}
+.meta{color:var(--mut);font-size:12px}
+main{max-width:1200px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.stat b{display:block;font-size:22px}.stat span{color:var(--mut);font-size:12px}
+nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;padding:6px 12px;cursor:pointer}
+button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.act{border-color:var(--acc);color:var(--acc)}
+button:disabled{opacity:.5;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:auto}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;color:var(--mut);font-weight:600;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+pre{margin:0;white-space:pre-wrap;word-break:break-all;max-height:140px;overflow:auto}
+.tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;background:var(--accbg);color:var(--acc)}
+.tag.ok{background:var(--okbg);color:var(--ok)}.tag.bad{background:var(--badbg);color:var(--bad)}.tag.warn{background:var(--warnbg);color:var(--warn)}
+.empty{padding:24px;text-align:center;color:var(--mut)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.banner{padding:10px 12px;border-radius:8px;margin-bottom:12px;background:var(--warnbg);color:var(--warn)}
+.post{padding:10px 12px;background:var(--accbg);font-weight:600}
+.mut{color:var(--mut)}
+@media(max-width:640px){th:nth-child(n+5),td:nth-child(n+5){display:none}}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--accbg)}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:flex-start;justify-content:center;padding:24px 12px;overflow:auto;z-index:5}
+#modal.show{display:flex}
+#box{background:var(--card);border:1px solid var(--line);border-radius:12px;max-width:860px;width:100%;padding:16px}
+#box h3{margin:16px 0 6px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+#box pre{max-height:360px;background:var(--bg);padding:10px;border-radius:8px}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}dt{color:var(--mut)}dd{margin:0;word-break:break-all}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Order Bot Admin</h1><div class="meta" id="cfg">đang tải…</div></div>
+  <div class="row"><span class="meta" id="upd"></span><button id="refresh">Làm mới</button><label class="meta"><input type="checkbox" id="auto" checked> tự động 5s</label></div>
+</header>
+<main>
+  <div id="banner"></div>
+  <div class="grid" id="stats"></div>
+  <nav id="tabs"></nav>
+  <div class="card" id="view"></div>
+</main>
+<div id="modal"><div id="box"></div></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = n => (n ?? 0).toLocaleString('vi-VN') + 'đ';
+const tm = t => t ? new Date(t).toLocaleString('vi-VN') : '';
+const TABS = [['comments','Comment & đơn'],['webhooks','Webhook log'],['scan','Quét Graph'],['jobs','Hàng đợi'],['posts','Bài viết'],['tools','Công cụ']];
+let tab = 'comments', data = null, scan = null, scanErr = null, toolOut = '';
+
+function tag(s){
+  const k = {SENT:'ok',READY:'ok',DONE:'ok',FAILED:'bad',DEAD:'bad',UNKNOWN:'warn',NEEDS_REVIEW:'warn',PENDING:'',RUNNING:'',SENDING:''}[s] ?? '';
+  return `<span class="tag ${k}">${esc(s)}</span>`;
+}
+function sum(o){return Object.entries(o||{}).map(([k,v])=>`${k}: ${v}`).join(' · ')||'—'}
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  if (!r.ok && r.status !== 502) throw new Error(r.status);
+  return r.json();
+}
+async function load(){
+  try { data = await api('/admin/api/overview'); } catch(e){ $('#banner').innerHTML = `<div class="banner">Lỗi tải dữ liệu: ${esc(e.message)}</div>`; return; }
+  $('#banner').innerHTML = data.config.dry_run ? '<div class="banner">DRY_RUN đang bật: worker không gửi tin thật.</div>' : '';
+  const c = data.config;
+  $('#cfg').textContent = `Page ${c.page_id} · Graph ${c.graph_version} · catalog mặc định: ${c.default_catalog || '(không)'}`;
+  $('#upd').textContent = 'cập nhật ' + new Date().toLocaleTimeString('vi-VN');
+  const n = data.counts;
+  $('#stats').innerHTML = [
+    ['Webhook hợp lệ', n.webhooks_ok, ''], ['Webhook sai chữ ký', n.webhooks_bad, ''],
+    ['Job', sum(n.jobs), 's'], ['Đơn', sum(n.orders), 's'], ['Tin nhắn', sum(n.messages), 's']
+  ].map(([l,v,s])=>`<div class="stat"><b style="${s?'font-size:13px':''}">${esc(v)}</b><span>${l}</span></div>`).join('');
+  render();
+}
+function table(head, rows){
+  if(!rows.length) return '<div class="empty">Chưa có dữ liệu</div>';
+  return `<table><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+function render(){
+  $('#tabs').innerHTML = TABS.map(([k,l])=>`<button class="${k===tab?'on':''}" data-t="${k}">${l}</button>`).join('');
+  document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;render();if(tab==='scan'&&!scan)doScan()});
+  if(!data) return;
+  let h = '';
+  if (tab==='comments') h = table(['Thời gian','Comment','Nội dung','Đơn','Tin nhắn'], data.comments.map(c=>`<tr>
+      <td class="mut">${tm(c.at)}</td>
+      <td><code>${esc(c.comment_id)}</code><div class="mut">user ${esc(c.user_id||'?')}</div></td>
+      <td>${esc(c.content)}</td>
+      <td>${c.order?tag(c.order.status)+`<div>${money(c.order.total)}</div><div class="mut">${esc(c.order.reason||'')}</div>`:''}</td>
+      <td>${c.message?tag(c.message.status)+`<div class="mut">${esc(c.message.error||'')} ${esc(c.message.detail||'')}</div>`:''}</td></tr>`));
+  if (tab==='webhooks') h = table(['Thời gian','Chữ ký','Comment event','Nguồn','Body (bấm để xem chi tiết)'], data.webhooks.map(w=>`<tr class="click" data-wh="${w.id}">
+      <td class="mut">${tm(w.at)}</td><td>${w.ok?'<span class="tag ok">hợp lệ</span>':'<span class="tag bad">sai</span>'}</td>
+      <td>${w.comments}</td><td class="mut">${esc(w.remote||'')}</td><td><pre>${esc(w.body)}</pre></td></tr>`));
+  if (tab==='jobs') h = table(['#','Trạng thái','Lần thử','Comment','Nội dung','Lỗi'], data.jobs.map(j=>`<tr>
+      <td>${j.id}</td><td>${tag(j.status)}</td><td>${j.attempts}</td><td><code>${esc(j.comment_id)}</code></td>
+      <td>${esc(j.message)}</td><td class="mut">${esc(j.error||'')}</td></tr>`));
+  if (tab==='posts') h = table(['Post ID','Nội dung','Link'], data.posts.map(p=>`<tr><td><code>${esc(p.post_id)}</code></td><td>${esc(p.message)}</td>
+      <td>${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener">mở</a>`:''}</td></tr>`));
+  if (tab==='scan') h = renderScan();
+  if (tab==='tools') h = `<div style="padding:14px"><div class="row">
+      <button class="act" id="sub">Subscribe Page vào feed</button></div>
+      <p class="mut">Gọi POST /{page}/subscribed_apps (feed) và hiển thị subscription hiện tại.</p>
+      <pre id="toolout">${esc(toolOut)}</pre></div>`;
+  $('#view').innerHTML = h;
+  document.querySelectorAll('[data-wh]').forEach(r=>r.onclick=()=>openWh(r.dataset.wh));
+  const sb = $('#sub'); if (sb) sb.onclick = async()=>{ sb.disabled=true; toolOut='đang gọi…'; $('#toolout').textContent=toolOut;
+      try{ toolOut = JSON.stringify(await api('/admin/api/subscribe',{method:'POST'}),null,2)}catch(e){toolOut='Lỗi '+e.message} sb.disabled=false; $('#toolout').textContent=toolOut; };
+  document.querySelectorAll('[data-imp]').forEach(b=>b.onclick=async()=>{ b.disabled=true; const [p,c]=b.dataset.imp.split('|');
+      const r = await api(`/admin/api/import/${encodeURIComponent(p)}/${encodeURIComponent(c)}`,{method:'POST'}); b.textContent = r.status||r.error; });
+}
+function renderScan(){
+  const top = `<div style="padding:10px 12px" class="row"><button class="act" id="rescan">Quét lại</button><span class="mut">Đọc trực tiếp từ Graph API: so với comment BE đã nhận qua webhook.</span></div>`;
+  if (scanErr) return top + `<div class="banner" style="margin:12px">${esc(scanErr)}</div>`;
+  if (!scan) return top + '<div class="empty">Đang quét…</div>';
+  if (!scan.posts.length) return top + '<div class="empty">Page chưa có bài viết</div>';
+  return top + scan.posts.map(p=>`<div class="post">${esc(p.message||'(không có chữ)')} <span class="mut">· ${esc(p.id)} · ${tm(p.at)}</span></div>` +
+    (p.comments.length ? table(['Thời gian','Comment','Người','Nội dung','BE nhận'], p.comments.map(c=>`<tr>
+      <td class="mut">${tm(c.at)}</td><td><code>${esc(c.id)}</code></td><td>${c.by_page?'<span class="tag warn">Page</span>':esc(c.from||'?')}</td>
+      <td>${esc(c.message)}</td><td>${c.received?'<span class="tag ok">đã nhận</span>':(c.by_page?'<span class="mut">bỏ qua</span>':`<span class="tag bad">chưa nhận</span> <button data-imp="${esc(p.id)}|${esc(c.id)}">Đưa vào xử lý</button>`)}</td></tr>`)) : '<div class="empty">Chưa có comment</div>')).join('');
+}
+async function openWh(id){
+  $('#modal').classList.add('show'); $('#box').innerHTML = '<div class="empty">Đang tải…</div>';
+  let w; try { w = await api('/admin/api/webhook/'+id); } catch(e){ $('#box').innerHTML = 'Lỗi '+esc(e.message); return; }
+  const proc = Object.entries(w.processing).map(([cid,p])=>`<div class="card" style="padding:10px;margin-bottom:8px">
+     <div><code>${esc(cid)}</code></div>
+     <dl><dt>Job</dt><dd>${p.job?tag(p.job.status)+' lần thử '+p.job.attempts+' '+esc(p.job.error||''):'—'}</dd>
+     <dt>Đơn</dt><dd>${p.order?tag(p.order.status)+' '+money(p.order.total)+' '+esc(p.order.reason||''):'—'}</dd>
+     <dt>Tin nhắn</dt><dd>${p.message?tag(p.message.status)+' '+esc(p.message.error||'')+' '+esc(p.message.detail||'')+(p.message.meta_id?' · id '+esc(p.message.meta_id):''):'—'}</dd></dl>
+     ${p.order&&p.order.items.length?`<pre>${esc(JSON.stringify(p.order.items,null,2))}</pre>`:''}
+     ${p.message&&p.message.text?`<pre>${esc(p.message.text)}</pre>`:''}</div>`).join('') || '<div class="mut">Không có comment event hợp lệ trong lần gửi này.</div>';
+  const evs = w.outcomes.map(e=>`<tr><td><code>${esc(e.comment_id)}</code></td><td><code>${esc(e.post_id||'')}</code></td><td>${esc(e.from_id||'?')}</td><td>${esc(e.message??'(thiếu)')}</td><td>${tag(e.result==='queued'?'DONE':'UNKNOWN').replace(/>.*?</,'>'+esc(e.result)+'<')}</td></tr>`).join('');
+  $('#box').innerHTML = `<div class="row" style="justify-content:space-between"><b>Webhook #${w.id}</b><button id="x">Đóng</button></div>
+    <dl><dt>Thời gian</dt><dd>${tm(w.at)}</dd><dt>Nguồn</dt><dd>${esc(w.remote||'')}</dd>
+    <dt>Chữ ký</dt><dd>${w.ok?'<span class="tag ok">hợp lệ</span>':'<span class="tag bad">sai / thiếu</span>'}</dd></dl>
+    <h3>Headers</h3><pre>${esc(JSON.stringify(w.headers,null,2))}</pre>
+    <h3>Comment event đã tách</h3>${evs?`<div class="card"><table><thead><tr><th>Comment</th><th>Post</th><th>Người</th><th>Nội dung</th><th>Kết quả</th></tr></thead><tbody>${evs}</tbody></table></div>`:'<div class="mut">Không có</div>'}
+    <h3>Kết quả xử lý</h3>${proc}
+    <h3>Body (raw JSON)</h3><pre>${esc(w.body)}</pre>`;
+  $('#x').onclick = closeWh;
+}
+function closeWh(){ $('#modal').classList.remove('show'); }
+$('#modal').onclick = e => { if (e.target.id==='modal') closeWh(); };
+document.addEventListener('keydown', e => { if (e.key==='Escape') closeWh(); });
+async function doScan(){
+  scan = null; scanErr = null; render();
+  const r = await api('/admin/api/graph-scan');
+  if (r.error) scanErr = r.error; else scan = r;
+  render();
+  const b = $('#rescan'); if (b) b.onclick = doScan;
+}
+document.addEventListener('click', e => { if (e.target.id==='rescan') doScan(); });
+$('#refresh').onclick = () => { load(); };
+setInterval(()=>{ if ($('#auto').checked && tab!=='scan' && tab!=='tools') load(); }, 5000);
+load();
+</script>
+</body>
+</html>
