@@ -1,12 +1,13 @@
 import hashlib, hmac, json, os, tempfile
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.config import Settings
-from app.db import Job, MessageLog, Order
+from app.db import FacebookCustomer, Job, MessageLog, MessengerOrderCustomer, Order, WebhookEvent
 from app.main import create_app
-from app.messenger import SendResult
+from app.messenger import Messenger, SendResult
 from app.worker import claim_job, process_job
 
 SECRET = "sekret"
@@ -200,3 +201,131 @@ def test_admin_ui_and_webhook_detail(env):
     assert d["outcomes"][0]["result"] == "queued" and "x-hub-signature-256" in d["headers"]
     assert "A1" in d["processing"] and "comment_id" in d["body"]
     assert c.get("/admin/api/webhook/9999", auth=auth).status_code == 404
+
+
+def test_customer_from_webhook_reuses_id(env):
+    cfg, _, client, Session = env
+    messenger = FakeMessenger()
+
+    def unexpected_fetch(_):
+        pytest.fail("complete webhook author should not require a Graph request")
+
+    messenger.fetch_comment = unexpected_fetch
+    for comment_id in ("C1", "C2"):
+        event = payload(comment_id)
+        event["entry"][0]["changes"][0]["value"]["from"]["name"] = "Nguyễn An"
+        assert post(client, event).status_code == 200
+        assert post(client, event).status_code == 200
+        assert run(env, messenger) == "SENT"
+    with Session() as s:
+        customer = s.scalars(select(FacebookCustomer)).one()
+        assert (customer.facebook_user_id, customer.facebook_name, customer.source) == (
+            "U1", "Nguyễn An", "COMMENT")
+        assert customer.collected_at and customer.psid is None
+        assert len(s.scalars(select(Order)).all()) == 2
+    assert len(messenger.calls) == 2
+    comments = client.get("/admin/api/overview", auth=("admin", cfg.admin_password)).json()["comments"]
+    assert all(comment["facebook_name"] == "Nguyễn An" for comment in comments)
+
+
+@pytest.mark.parametrize(("http_status", "graph_response", "expected", "diagnostic"), [
+    (200, {"from": {"id": "U2", "name": "An"}}, ("U2", "An"), None),
+    (200, {"from": {"id": "U2"}}, ("U2", None), "author fields not returned"),
+    (200, {"from": {"name": "An"}}, (None, "An"), "author fields not returned"),
+    (403, {"error": {"code": 200, "message": "sensitive text"}}, (None, None), "permission_or_access"),
+    (200, {"error": {"code": 10}}, (None, None), "permission_or_access"),
+    (400, {"error": {"code": 190, "error_subcode": 463}}, (None, None), "token_expired"),
+    (400, {"error": {"code": 190}}, (None, None), "token_invalid"),
+    (429, {"error": {"code": 4}}, (None, None), "rate_limit_or_transient"),
+])
+def test_comment_graph_enrichment_is_best_effort(env, caplog, http_status, graph_response, expected, diagnostic):
+    cfg, _, client, Session = env
+
+    def response(request):
+        assert request.url.path.endswith("/C1")
+        assert request.url.params["fields"] == "id,message,from,created_time"
+        assert request.headers["Authorization"] == f"Bearer {cfg.page_access_token}"
+        return httpx.Response(http_status, json=graph_response)
+
+    messenger = FakeMessenger()
+    with httpx.Client(transport=httpx.MockTransport(response)) as http:
+        messenger.fetch_comment = Messenger(cfg, http).fetch_comment
+        caplog.set_level("INFO")
+        post(client, payload(frm=None))
+        assert run(env, messenger) == "SENT"
+
+    with Session() as s:
+        customer = s.scalars(select(FacebookCustomer)).one()
+        assert (customer.facebook_user_id, customer.facebook_name) == expected
+        assert customer.profile_url is None and customer.email is None
+        assert s.scalars(select(Order)).one().status == "READY"
+    if diagnostic:
+        assert diagnostic in caplog.text
+    assert "sensitive text" not in caplog.text
+
+
+def test_messenger_profiles_and_verified_order_link(env):
+    cfg, _, client, Session = env
+    messenger = FakeMessenger()
+    post(client, payload())
+    assert run(env, messenger) == "SENT"
+
+    def response(request):
+        assert request.url.path.endswith("/U1")
+        assert request.url.params["fields"] == "first_name,last_name,profile_pic"
+        return httpx.Response(200, json={"first_name": "An", "last_name": "Nguyễn",
+                                        "profile_pic": "https://example.com/photo"})
+
+    email = "test@example.com"
+    message = {"mid": "incoming-1", "text": f"Email: {email}", "reply_to": {"mid": "m1"}}
+    event = {"sender": {"id": "U1"}, "recipient": {"id": "P1"}, "message": message}
+    body = {"object": "page", "entry": [{"id": "P1", "messaging": [
+        event, {**event, "message": {**message, "mid": "echo", "is_echo": True}},
+        {**event, "recipient": {"id": "P2"}},
+    ]}]}
+    with httpx.Client(transport=httpx.MockTransport(response)) as http:
+        messenger.fetch_profile = Messenger(cfg, http).fetch_profile
+        assert post(client, body).status_code == 200
+        assert post(client, body).status_code == 200
+        assert run(env, messenger) == "PROFILE_SAVED"
+        assert claim_job(Session) is None
+
+        message.update(mid="incoming-2", text="Cảm ơn", reply_to={"mid": "unknown"})
+        assert post(client, body).status_code == 200
+        assert run(env, messenger) == "PROFILE_SAVED"
+
+    with Session() as s:
+        customers = {c.source: c for c in s.scalars(select(FacebookCustomer))}
+        assert len(customers) == 2
+        customer = customers["MESSENGER"]
+        assert (customer.psid, customer.facebook_user_id, customer.facebook_name) == ("U1", None, "An Nguyễn")
+        assert customer.email == email and customer.profile_picture == "https://example.com/photo"
+        assert customer.profile_url is None
+        order = s.scalars(select(Order)).one()
+        link = s.scalars(select(MessengerOrderCustomer)).one()
+        assert (link.order_id, link.customer_id) == (order.id, customer.id)
+        assert all(email not in event.body for event in s.scalars(select(WebhookEvent)))
+    assert len(messenger.calls) == 1
+
+
+def test_messenger_permission_error_still_saves_psid_and_email(env, caplog):
+    cfg, _, client, Session = env
+    messenger = FakeMessenger()
+    body = {"object": "page", "entry": [{"id": "P1", "messaging": [{
+        "sender": {"id": "PS1"}, "recipient": {"id": "P1"},
+        "message": {"mid": "incoming", "text": "an@example.com"},
+    }]}]}
+    with httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(403, json={"error": {"code": 200, "message": "private"}}))) as http:
+        messenger.fetch_profile = Messenger(cfg, http).fetch_profile
+        assert post(client, body).status_code == 200
+        assert run(env, messenger) == "PROFILE_SAVED"
+    with Session() as s:
+        customer = s.scalars(select(FacebookCustomer)).one()
+        assert (customer.psid, customer.email, customer.facebook_name) == ("PS1", "an@example.com", None)
+        assert "pages_messaging" in s.scalars(select(Job)).one().last_error
+        assert not s.scalars(select(Order)).all()
+        assert not s.scalars(select(MessengerOrderCustomer)).all()
+    assert not messenger.calls
+    assert "an@example.com" not in caplog.text
+    assert "permission_or_access" in caplog.text
