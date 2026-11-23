@@ -114,8 +114,8 @@ function render(){
       <td>${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener">mở</a>`:''}</td></tr>`));
   if (tab==='scan') h = renderScan();
   if (tab==='tools') h = `<div style="padding:14px"><div class="row">
-      <button class="act" id="sub">Subscribe Page vào feed</button></div>
-      <p class="mut">Gọi POST /{page}/subscribed_apps (feed) và hiển thị subscription hiện tại.</p>
+      <button class="act" id="sub">Subscribe Page vào feed và messages</button></div>
+      <p class="mut">Gọi POST /{page}/subscribed_apps (feed, messages) và hiển thị subscription hiện tại.</p>
       <pre id="toolout">${esc(toolOut)}</pre></div>`;
   $('#view').innerHTML = h;
   document.querySelectorAll('[data-wh]').forEach(r=>r.onclick=()=>openWh(r.dataset.wh));

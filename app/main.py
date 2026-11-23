@@ -8,11 +8,17 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
-from .db import Base, Job, MessageLog, Order, WebhookEvent, make_session_factory
+from .customers import actor, supplied_email, text_value
+from .db import Job, MessageLog, Order, WebhookEvent, create_schema, make_session_factory
 from .security import verify_signature
 from .seed import load_seed
 
 log = logging.getLogger("api")
+
+
+def _entries(payload):
+    entries = payload.get("entry") if isinstance(payload, dict) else None
+    return entries if isinstance(entries, list) else []
 
 
 def extract_comment_events(payload: dict) -> list[dict]:
@@ -20,7 +26,7 @@ def extract_comment_events(payload: dict) -> list[dict]:
     out = []
     if not isinstance(payload, dict) or payload.get("object") != "page":
         return out
-    for entry in payload.get("entry") or []:
+    for entry in _entries(payload):
         if not isinstance(entry, dict):
             continue
         for ch in entry.get("changes") or []:
@@ -30,13 +36,39 @@ def extract_comment_events(payload: dict) -> list[dict]:
             if not isinstance(v, dict) or v.get("item") != "comment" or v.get("verb") != "add" \
                     or not v.get("comment_id"):
                 continue
-            frm = v.get("from") if isinstance(v.get("from"), dict) else {}
+            from_id, from_name = actor(v.get("from"))
             out.append({"page_id": str(entry.get("id", "")), "comment_id": str(v["comment_id"]),
                         "post_id": str(v["post_id"]) if v.get("post_id") else None,
                         "message": v.get("message") if isinstance(v.get("message"), str) else None,
-                        "from_id": str(frm["id"]) if frm.get("id") else None,
+                        "from_id": from_id, "from_name": from_name,
                         "parent_id": v.get("parent_id")})
     return out
+
+
+def extract_messenger_events(payload, page_id):
+    if not isinstance(payload, dict) or payload.get("object") != "page" or not page_id:
+        return
+    for entry in _entries(payload):
+        if not isinstance(entry, dict) or str(entry.get("id")) != page_id:
+            continue
+        events = entry.get("messaging")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            if not isinstance(message, dict) or message.get("is_echo"):
+                continue
+            psid, _ = actor(event.get("sender"))
+            recipient, _ = actor(event.get("recipient"))
+            mid = text_value(message.get("mid"))
+            if not psid or len(psid) > 64 or psid == page_id or recipient != page_id or not mid or len(mid) > 128:
+                continue
+            reply = message.get("reply_to")
+            yield {"kind": "messenger", "page_id": page_id, "psid": psid, "mid": mid,
+                   "reply_mid": text_value(reply.get("mid")) if isinstance(reply, dict) else None,
+                   "email": supplied_email(message.get("text"))}
 
 
 KEEP_HEADERS = ("content-type", "content-length", "user-agent", "x-hub-signature-256",
@@ -59,7 +91,7 @@ def _record(Session, request, ok: bool, raw: bytes, outcomes: list | None = None
 def create_app(cfg: Settings | None = None) -> FastAPI:
     cfg = cfg or Settings.load()
     engine, Session = make_session_factory(cfg.database_url)
-    Base.metadata.create_all(engine)
+    create_schema(engine)
     load_seed(Session, cfg.seed_file)
     app = FastAPI(docs_url=None, redoc_url=None)
     app.state.Session, app.state.cfg = Session, cfg
@@ -77,7 +109,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         raw = await request.body()
         ok = verify_signature(raw, request.headers.get("X-Hub-Signature-256"), cfg.app_secret)
         if not ok:
-            _record(Session, request, False, raw)
+            _record(Session, request, False, b"")
             return PlainTextResponse("forbidden", status_code=403)
         try:
             payload = json.loads(raw)
@@ -95,6 +127,20 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             except IntegrityError:
                 log.info("[cid=%s comment=%s] duplicate webhook ignored", cid, ev["comment_id"])
                 outcomes.append({**ev, "result": "duplicate"})
+        for ev in extract_messenger_events(payload, cfg.page_id):
+            try:
+                with Session() as s, s.begin():
+                    s.add(Job(dedupe_key=f"messenger:{ev['page_id']}:{ev['mid']}",
+                              correlation_id=cid, payload=ev))
+            except IntegrityError:
+                log.info("[cid=%s] duplicate Messenger webhook ignored", cid)
+
+        # Keep feed diagnostics without copying private conversations into the webhook viewer.
+        if any(isinstance(entry, dict) and "messaging" in entry for entry in _entries(payload)):
+            raw = json.dumps({**payload, "entry": [
+                {key: value for key, value in entry.items() if key != "messaging"}
+                for entry in _entries(payload) if isinstance(entry, dict)
+            ]}, ensure_ascii=False).encode()
         _record(Session, request, True, raw, outcomes)
         return PlainTextResponse("ok")
 

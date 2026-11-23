@@ -2,13 +2,14 @@ import datetime as dt
 import logging
 import time
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import templates
 from .config import Settings
-from .db import (PostInfo, CatalogItem, FacebookComment, FacebookPost, Job, MessageLog, Order, utcnow)
-from .messenger import Messenger
+from .db import (PostInfo, CatalogItem, FacebookComment, FacebookCustomer, FacebookPost, Job, MessageLog, Order, utcnow)
+from .customers import actor, link_messenger_reply, save_customer, text_value
+from .messenger import GraphReadError, Messenger
 from .parser import PARSER_VERSION, parse_comment
 
 log = logging.getLogger("worker")
@@ -60,36 +61,94 @@ def _backoff(cfg: Settings, attempt: int) -> int:
     return min(cfg.backoff_base_seconds * 2 ** (attempt - 1), 3600)
 
 
+def _process_messenger(Session, cfg, messenger, job_id, payload, cid):
+    page_id, psid = payload["page_id"], payload["psid"]
+    if page_id != cfg.page_id:
+        _finish(Session, job_id, "DONE", "page_not_allowed")
+        return "SKIPPED"
+
+    failure = None
+    try:
+        data = messenger.fetch_profile(psid) or {}
+    except GraphReadError as error:
+        failure = str(error)
+        log.warning("[cid=%s] %s", cid, failure)
+        data = {}
+
+    name = " ".join(filter(None, map(text_value, (data.get("first_name"), data.get("last_name"))))) or None
+    picture = text_value(data.get("profile_pic"))
+    if not cfg.dry_run and not failure and (not name or not picture):
+        failure = "GET /{PSID}: profile fields not returned"
+        log.info("[cid=%s] %s name=%s picture=%s", cid, failure, bool(name), bool(picture))
+
+    with Session() as s, s.begin():
+        customer_id = save_customer(s, page_id, f"psid:{psid}", "MESSENGER",
+                                    psid=psid, facebook_name=name, profile_picture=picture,
+                                    email=payload.get("email"))
+        linked = link_messenger_reply(s, page_id, payload.get("reply_mid"), customer_id)
+        if payload.get("reply_mid") and not linked:
+            log.info("[cid=%s] reply did not match a unique sent private reply", cid)
+        _finish_in(s, job_id, "DONE", failure)
+    return "PROFILE_SAVED"
+
+
 def process_job(Session, cfg: Settings, messenger: Messenger, job_id: int) -> str:
     with Session() as s:
         job = s.get(Job, job_id)
         p, cid, attempts = job.payload, job.correlation_id, job.attempts
+    if p.get("kind") == "messenger":
+        return _process_messenger(Session, cfg, messenger, job_id, p, cid)
+
     page_id, comment_id = p["page_id"], p["comment_id"]
     tag = f"[cid={cid} comment={comment_id}]"
 
-    _cache_post(Session, messenger, page_id, p.get("post_id"), tag)
+    if page_id == cfg.page_id:
+        _cache_post(Session, messenger, page_id, p.get("post_id"), tag)
 
-    # 1. fill missing fields from Graph (payload may lack message/from)
-    message, user_id = p.get("message"), p.get("from_id")
-    if message is None or user_id is None:
+    message, user_id, name = p.get("message"), p.get("from_id"), p.get("from_name")
+    if page_id == cfg.page_id and user_id != page_id and (message is None or not user_id or not name):
         try:
             data = messenger.fetch_comment(comment_id) or {}
-            message = message if message is not None else data.get("message")
-            user_id = user_id or (data.get("from") or {}).get("id")
-        except Exception as e:
-            log.warning("%s fetch_comment failed: %s", tag, type(e).__name__)
-            if attempts >= cfg.max_attempts:
-                _finish(Session, job_id, "DEAD", f"fetch:{type(e).__name__}")
-                return "DEAD"
-            _finish(Session, job_id, "PENDING", f"fetch:{type(e).__name__}", _backoff(cfg, attempts))
-            return "RETRY"
+        except GraphReadError as error:
+            log.warning("%s %s", tag, error)
+            # Only retry a transient failure when the existing order flow still needs the text.
+            if message is None and error.retryable and attempts < cfg.max_attempts:
+                _finish(Session, job_id, "PENDING", str(error), _backoff(cfg, attempts))
+                return "RETRY"
+        else:
+            if message is None:
+                message = data.get("message")
+            graph_id, graph_name = actor(data.get("from"))
+            if not user_id or not graph_id or user_id == graph_id:
+                user_id, name = user_id or graph_id, name or graph_name
+            else:
+                log.warning("%s GET /{comment_id}: author ID differs from webhook", tag)
+            if not cfg.dry_run and (not user_id or not name):
+                log.info("%s GET /{comment_id}: author fields not returned id=%s name=%s",
+                         tag, bool(user_id), bool(name))
 
     with Session() as s, s.begin():
         post_id = p.get("post_id")
-        if not s.execute(select(FacebookComment.id).where(
-                FacebookComment.page_id == page_id, FacebookComment.comment_id == comment_id)).first():
-            s.add(FacebookComment(page_id=page_id, comment_id=comment_id, post_id=post_id,
-                                  user_id=user_id, content=message))
+        comment = s.scalar(select(FacebookComment).where(
+            FacebookComment.page_id == page_id, FacebookComment.comment_id == comment_id))
+        if comment is None:
+            comment = FacebookComment(page_id=page_id, comment_id=comment_id, post_id=post_id,
+                                      user_id=user_id, content=message)
+            s.add(comment)
+        elif comment.user_id is None and user_id is not None:
+            comment.user_id = user_id
+
+        if page_id == cfg.page_id and user_id != page_id:
+            if user_id and p.get("from_id") != user_id:
+                s.execute(delete(FacebookCustomer).where(
+                    FacebookCustomer.page_id == page_id,
+                    FacebookCustomer.identity_key == f"comment:{comment_id}",
+                ))
+            # A missing ID is only scoped to this comment, so it never matches another customer by name.
+            key = f"comment-user:{user_id}" if user_id else f"comment:{comment_id}"
+            save_customer(s, page_id, key, "COMMENT", facebook_user_id=user_id, facebook_name=name)
+            if (message, user_id, name) != (p.get("message"), p.get("from_id"), p.get("from_name")):
+                s.get(Job, job_id).payload = {**p, "message": message, "from_id": user_id, "from_name": name}
         # 2. filters
         if page_id != cfg.page_id or (user_id and user_id == cfg.page_id):
             skip = "page_not_allowed_or_self_comment"

@@ -1,6 +1,6 @@
 import datetime as dt
 from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer,
-                        String, Text, UniqueConstraint, create_engine, Index)
+                        String, Text, UniqueConstraint, create_engine, Index, text)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -117,6 +117,28 @@ class MessageLog(Base):
     __table_args__ = (UniqueConstraint("page_id", "comment_id", "action", name="uq_message_action"),)
 
 
+class FacebookCustomer(Base):
+    __tablename__ = "facebook_customers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    page_id: Mapped[str] = mapped_column(String(64))
+    identity_key: Mapped[str] = mapped_column(String(160))
+    facebook_user_id: Mapped[str | None] = mapped_column(String(64))
+    psid: Mapped[str | None] = mapped_column(String(64))
+    facebook_name: Mapped[str | None] = mapped_column(Text)
+    profile_picture: Mapped[str | None] = mapped_column(Text)
+    profile_url: Mapped[str | None] = mapped_column(Text)
+    email: Mapped[str | None] = mapped_column(String(254))
+    source: Mapped[str] = mapped_column(String(16))
+    collected_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("page_id", "identity_key", name="uq_customer_identity"),)
+
+
+class MessengerOrderCustomer(Base):
+    __tablename__ = "messenger_order_customers"
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("facebook_customers.id"), primary_key=True)
+
+
 class Job(Base):
     """Durable queue. Webhook inserts; worker claims with SKIP LOCKED."""
     __tablename__ = "jobs"
@@ -134,8 +156,16 @@ class Job(Base):
     __table_args__ = (Index("ix_jobs_pick", "status", "next_run_at"),)
 
 
+def create_schema(engine):
+    with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            # API and worker can initialize the same database concurrently.
+            connection.execute(text("SELECT pg_advisory_xact_lock(264318, 1)"))
+        Base.metadata.create_all(connection)
+
+
 def make_session_factory(url: str):
-    kwargs = {"pool_pre_ping": True}
+    kwargs = {"pool_pre_ping": True, "hide_parameters": True}
     if url.startswith("sqlite"):
         kwargs = {"connect_args": {"check_same_thread": False}}
     engine = create_engine(url, **kwargs)

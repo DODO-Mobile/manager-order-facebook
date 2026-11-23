@@ -1,4 +1,4 @@
-"""One-off: subscribe Page to this App for the `feed` field, then show current subscription.
+"""One-off: subscribe Page to this App for the `feed` and `messages` fields, then show current subscription.
 Usage: python -m app.subscribe_page
 """
 import json

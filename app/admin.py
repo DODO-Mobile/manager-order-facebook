@@ -3,11 +3,12 @@ import secrets
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 
-from .db import (FacebookComment, Job, MessageLog, Order, PostInfo, WebhookEvent)
-from .messenger import Messenger
+from .customers import actor
+from .db import (FacebookCustomer, FacebookComment, Job, MessageLog, Order, PostInfo, WebhookEvent)
+from .messenger import GraphReadError, Messenger
 import os
 
 basic = HTTPBasic(realm="fb-order-admin")
@@ -60,10 +61,18 @@ def build_router(cfg, Session) -> APIRouter:
             orders = {(o.page_id, o.comment_id): o for o in s.execute(select(Order)).scalars()}
             logs = {(m.page_id, m.comment_id): m for m in s.execute(select(MessageLog)).scalars()}
             rows = []
-            for c in s.execute(select(FacebookComment).order_by(FacebookComment.id.desc()).limit(50)).scalars():
+            identity = case(
+                (FacebookComment.user_id.is_not(None), "comment-user:" + FacebookComment.user_id),
+                else_="comment:" + FacebookComment.comment_id,
+            )
+            comments = select(FacebookComment, FacebookCustomer.facebook_name).outerjoin(
+                FacebookCustomer, (FacebookCustomer.page_id == FacebookComment.page_id)
+                & (FacebookCustomer.identity_key == identity),
+            ).order_by(FacebookComment.id.desc()).limit(50)
+            for c, facebook_name in s.execute(comments):
                 o, m = orders.get((c.page_id, c.comment_id)), logs.get((c.page_id, c.comment_id))
                 rows.append({"comment_id": c.comment_id, "post_id": c.post_id, "user_id": c.user_id,
-                             "content": c.content, "at": _iso(c.received_at),
+                             "content": c.content, "at": _iso(c.received_at), "facebook_name": facebook_name,
                              "order": {"status": o.status, "total": o.total, "reason": o.review_reason,
                                        "items": o.items_json} if o else None,
                              "message": {"status": m.status, "error": m.error_code, "detail": m.error_message,
@@ -124,16 +133,34 @@ def build_router(cfg, Session) -> APIRouter:
         """Manually push a Graph comment into the queue (same path as a webhook)."""
         try:
             data = messenger.fetch_comment(comment_id) or {}
-        except Exception as e:
-            return JSONResponse({"error": type(e).__name__}, status_code=502)
+        except GraphReadError as error:
+            return JSONResponse({"error": str(error)}, status_code=502)
+        from_id, from_name = actor(data.get("from"))
         ev = {"page_id": cfg.page_id, "comment_id": comment_id, "post_id": post_id,
-              "message": data.get("message"), "from_id": (data.get("from") or {}).get("id")}
+              "message": data.get("message"), "from_id": from_id, "from_name": from_name}
         try:
             with Session() as s, s.begin():
                 s.add(Job(dedupe_key=f"{cfg.page_id}:{comment_id}", correlation_id="admin-import", payload=ev))
         except IntegrityError:
             return {"status": "already_queued"}
         return {"status": "queued"}
+
+    @r.get("/api/meta/token", dependencies=[Depends(auth)])
+    def check_page_token():
+        if cfg.dry_run:
+            return {"status": "dry_run"}
+        if not cfg.page_access_token or not cfg.page_id:
+            return {"status": "missing_configuration"}
+        try:
+            token_page = messenger.token_page() or {}
+        except GraphReadError as error:
+            return JSONResponse({"status": "graph_error", "error": str(error)}, status_code=502)
+        return {"status": "matches_page" if token_page.get("id") == cfg.page_id else "wrong_page_or_user_token",
+                "permissions_to_check": {
+                    "comment": ["pages_read_engagement", "pages_read_user_content"],
+                    "webhook": ["pages_manage_metadata"],
+                    "messenger": ["pages_messaging"],
+                }}
 
     @r.post("/api/subscribe", dependencies=[Depends(auth)])
     def subscribe():
